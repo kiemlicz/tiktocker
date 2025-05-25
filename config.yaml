@@ -1,0 +1,11 @@
+s3:
+  host: ""
+  bucket: ""
+  prefix: ""
+
+mikrotiks:
+  - host: ""
+    username: ""
+    password: ""
+
+
