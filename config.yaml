@@ -1,11 +1,11 @@
-s3:
-  host: ""
-  bucket: ""
-  prefix: ""
+#s3:
+#  host: ""
+#  bucket: ""
+#  prefix: ""
 
 mikrotiks:
-  - host: ""
+  192.168.1.1:
     username: ""
     password: ""
-
-
+    encryptionKey: ""
+    downloadTo: "file:///tmp/" # s3://host/bucket/prefix/ file://local/path/

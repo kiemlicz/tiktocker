@@ -12,45 +12,85 @@ import (
 )
 
 const (
-	BackupPath  = "rest/backup/save"
-	FileGetPath = "rest/file/read"
-	FileInfo    = "rest/file"
+	BackupPath     = "rest/system/backup/save"
+	FileGetPath    = "rest/file/read"
+	FileInfo       = "rest/file"
+	SystemIdentity = "rest/system/identity"
 
 	ContentType = "application/json"
 	ChunkSize   = 10 * 1024
 )
 
 type BackupSettings struct {
-	BackupName    string
-	Encrypt       bool
+	BaseUrl *url.URL
+
 	EncryptionKey string
+
+	DownloadTo *url.URL
+
+	Timeout time.Duration
+}
+
+type BackupFile struct {
+	Name     string
+	Size     int
+	Contents []byte
 }
 
 type RequestResult struct {
-	fileSize   int
-	backupFile []byte
+	File BackupFile
 
-	err error
+	Err error
 }
 
-func MikrotikBackup(baseUrl *url.URL, settings BackupSettings, deviceComms chan RequestResult) {
+func MikrotikBackup(settings *BackupSettings, deviceComms chan *RequestResult) {
+	util.Log.Infof("backing up Mikrotik: %s", settings.BaseUrl)
+
+	internalChannel := make(chan *RequestResult) //TODO is this mixing channels normal in go?! change types if so
 	//TODO if channel is created outside - what about mixing messages in channel?
+
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
 
-	go performBackup(client, baseUrl, settings, deviceComms)
-
-	backupResponse := <-deviceComms
-
-	if backupResponse.err != nil {
-		go fileInfo(client, baseUrl, settings, deviceComms)
-		fileInfoResponse := <-deviceComms
-	} else {
-		deviceComms <- RequestResult{
-			err: fmt.Errorf("Failed to perform backup: %v", backupResponse.err),
+	go getIdentity(client, settings, internalChannel)
+	systemIdentity := <-internalChannel
+	if systemIdentity.Err != nil {
+		deviceComms <- &RequestResult{
+			Err: fmt.Errorf("failed to get system identity: %v", systemIdentity.Err),
 		}
+		return
 	}
+
+	backupName := systemIdentity.File.Name
+	go performBackup(client, backupName, settings, internalChannel)
+	backupResponse := <-internalChannel
+	if backupResponse.Err != nil {
+		deviceComms <- &RequestResult{
+			Err: fmt.Errorf("failed to perform backup: %v", backupResponse.Err),
+		}
+		return
+	}
+
+	go fileInfo(client, backupName, settings, internalChannel)
+	fileInfoResponse := <-internalChannel
+	if fileInfoResponse.Err != nil {
+		deviceComms <- &RequestResult{
+			Err: fmt.Errorf("failed to get file info: %v", fileInfoResponse.Err),
+		}
+		return
+	}
+
+	go downloadBackup(client, fileInfoResponse.File.Name, fileInfoResponse.File.Size, settings, internalChannel)
+	downloadResponse := <-internalChannel
+	if downloadResponse.Err != nil {
+		deviceComms <- &RequestResult{
+			Err: fmt.Errorf("failed to download backup: %v", downloadResponse.Err),
+		}
+		return
+	}
+
+	deviceComms <- downloadResponse
 }
 
 func doRequest(client *http.Client, url *url.URL, method string, body *map[string]interface{}) (*http.Response, error) {
@@ -79,98 +119,130 @@ func doRequest(client *http.Client, url *url.URL, method string, body *map[strin
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		util.Log.Warnf("Request returned status: %s", resp.Status)
+		util.Log.Warnf("request returned status: %s", resp.Status)
 		return nil, fmt.Errorf("request returned status: %s", resp.Status)
 	}
 
 	return resp, nil
 }
 
+func getIdentity(client *http.Client, settings *BackupSettings, results chan<- *RequestResult) {
+	identityUrl := *settings.BaseUrl
+	identityUrl.Path = identityUrl.ResolveReference(&url.URL{Path: SystemIdentity}).Path
+	util.Log.Debugf("requesting Mikrotik identity %s", identityUrl.String())
+
+	resp, err := doRequest(client, &identityUrl, http.MethodGet, nil)
+	if err != nil {
+		util.Log.Errorf("failed to get system identity: %v", err)
+		results <- &RequestResult{Err: err}
+		return
+	}
+
+	var systemIdentity map[string]string
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&systemIdentity); err != nil {
+		util.Log.Errorf("failed to decode system info response: %v", err)
+		results <- &RequestResult{Err: err}
+		return
+	}
+
+	util.Log.Debugf("discovered Mikrotik identity: %s", systemIdentity["name"])
+	results <- &RequestResult{File: BackupFile{Name: systemIdentity["name"]}, Err: nil}
+}
+
 // selecting encryption without password has the same effect as selecting no encryption
-func performBackup(client *http.Client, baseUrl *url.URL, settings BackupSettings, results chan<- RequestResult) {
+func performBackup(client *http.Client, identity string, settings *BackupSettings, results chan<- *RequestResult) {
+	encrypt := true
 	// If encryption is requested but no key is provided, disable encryption
-	if settings.Encrypt && settings.EncryptionKey == "" {
-		util.Log.Warn("Encryption requested but no encryption key provided; proceeding without encryption")
-		settings.Encrypt = false
+	if settings.EncryptionKey == "" {
+		util.Log.Warn("encryption disabled")
+		encrypt = false
 	}
 
 	body := map[string]interface{}{
-		"name":         settings.BackupName,
-		"dont-encrypt": !settings.Encrypt,
+		"name":         identity,
+		"dont-encrypt": !encrypt,
 	}
-	if settings.Encrypt {
+	if encrypt {
 		body["password"] = settings.EncryptionKey
 	}
 
-	backupRequestUrl := *baseUrl
+	backupRequestUrl := *settings.BaseUrl
 	backupRequestUrl.Path = backupRequestUrl.ResolveReference(&url.URL{Path: BackupPath}).Path
+	util.Log.Debugf("requesting backup for %s at %s", identity, backupRequestUrl.String())
 
 	resp, err := doRequest(client, &backupRequestUrl, http.MethodPost, &body)
 	if err != nil {
-		util.Log.Errorf("Failed to perform backup: %v", err)
-		results <- RequestResult{err: err}
+		util.Log.Errorf("failed to perform backup: %v", err)
+		results <- &RequestResult{Err: err}
+		return
 	}
 
 	var result map[string]interface{}
 	decoder := json.NewDecoder(resp.Body)
 	if err := decoder.Decode(&result); err != nil {
-		util.Log.Errorf("Failed to decode backup response: %v", err)
-		results <- RequestResult{err: err}
+		util.Log.Errorf("failed to decode backup response: %v", err)
+		results <- &RequestResult{Err: err}
 		return
 	}
-	results <- RequestResult{err: nil}
+	util.Log.Debugf("backup requested for %s", identity)
+	results <- &RequestResult{Err: nil}
 }
 
-func fileInfo(client *http.Client, baseUrl *url.URL, settings BackupSettings, results chan<- RequestResult) {
-	fileInfoRequestUrl := *baseUrl
+func fileInfo(client *http.Client, identity string, settings *BackupSettings, results chan<- *RequestResult) {
+	fileInfoRequestUrl := *settings.BaseUrl
 	q := fileInfoRequestUrl.Query()
-	q.Set("name", settings.BackupName)
+	q.Set("name", identity)
 	fileInfoRequestUrl.RawQuery = q.Encode()
 	fileInfoRequestUrl.Path = fileInfoRequestUrl.ResolveReference(&url.URL{Path: FileInfo}).Path
 
+	util.Log.Infof("requesting backup file info for %s at %s", identity, fileInfoRequestUrl.String())
+
 	resp, err := doRequest(client, &fileInfoRequestUrl, http.MethodGet, nil)
 	if err != nil {
-		util.Log.Errorf("Failed to get file info: %v", err)
-		results <- RequestResult{err: err}
+		util.Log.Errorf("failed to get file info: %v", err)
+		results <- &RequestResult{Err: err}
+		return
 	}
 
 	var fileInfoList []map[string]interface{}
 	decoder := json.NewDecoder(resp.Body)
 	if err := decoder.Decode(&fileInfoList); err != nil {
-		util.Log.Errorf("Failed to decode file info response: %v", err)
-		results <- RequestResult{err: err}
+		util.Log.Errorf("failed to decode file info response: %v", err)
+		results <- &RequestResult{Err: err}
 		return
 	}
 	if len(fileInfoList) == 0 {
-		results <- RequestResult{err: fmt.Errorf("Backup file not found: %s", settings.BackupName)}
+		results <- &RequestResult{Err: fmt.Errorf("backup file not found: %s", identity)}
 		return
 	}
 	size, ok := fileInfoList[0]["size"].(int)
 	if !ok {
-		results <- RequestResult{err: fmt.Errorf("size field not found in file info")}
+		results <- &RequestResult{Err: fmt.Errorf("size field not found in file info")}
 		return
 	}
-	results <- RequestResult{fileSize: size, err: nil}
+	results <- &RequestResult{File: BackupFile{Size: size}, Err: nil}
 }
 
-func downloadBackup(client *http.Client, baseUrl *url.URL, fileSize int, settings BackupSettings, results chan<- RequestResult) {
+func downloadBackup(client *http.Client, fileName string, fileSize int, settings *BackupSettings, results chan<- *RequestResult) {
 	fileContent := make([]byte, 0)
-	saveUrl := *baseUrl
-	saveUrl.Path = saveUrl.ResolveReference(&url.URL{Path: FileGetPath}).Path
+	backupFileName := fmt.Sprintf("%s.backup", fileName)
+	fileReadPath := *settings.BaseUrl
+	fileReadPath.Path = fileReadPath.ResolveReference(&url.URL{Path: FileGetPath}).Path
 	const Offset = "offset"
 
 	body := map[string]interface{}{
-		"file":       settings.BackupName + ".backup",
+		"file":       backupFileName,
 		"chunk-size": ChunkSize,
 		Offset:       0,
 	}
 
 	fetchChunk := func(offset int) {
 		body[Offset] = offset
-		resp, err := doRequest(client, &saveUrl, "POST", &body)
+		resp, err := doRequest(client, &fileReadPath, "POST", &body)
 		if err != nil {
-			util.Log.Errorf("Backup request failed: %v", err)
-			results <- RequestResult{err: err}
+			util.Log.Errorf("Backup request (offset: %d) failed: %v", offset, err)
+			results <- &RequestResult{Err: err}
 			return
 		}
 		defer resp.Body.Close()
@@ -178,11 +250,13 @@ func downloadBackup(client *http.Client, baseUrl *url.URL, fileSize int, setting
 		fileData, err := io.ReadAll(resp.Body)
 		if err != nil {
 			util.Log.Errorf("Failed to read backup response: %v", err)
-			results <- RequestResult{err: err}
+			results <- &RequestResult{Err: err}
 			return
 		}
 		fileContent = append(fileContent, fileData...)
 	}
+
+	util.Log.Infof("Downloading backup file %s of size %d bytes, from: %s", fileName, fileSize, fileReadPath.String())
 
 	offset := 0
 	done := make(chan bool)
@@ -195,6 +269,5 @@ func downloadBackup(client *http.Client, baseUrl *url.URL, fileSize int, setting
 		offset += ChunkSize
 	}
 
-	results <- RequestResult{backupFile: fileContent, fileSize: fileSize, err: nil}
-
+	results <- &RequestResult{File: BackupFile{Contents: fileContent, Size: fileSize, Name: backupFileName}, Err: nil}
 }
