@@ -2,11 +2,16 @@ package backup
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	scp "github.com/bramvdbogaerde/go-scp"
+	"github.com/bramvdbogaerde/go-scp/auth"
+	"golang.org/x/crypto/ssh"
 	"io"
 	"net/http"
 	"net/url"
+
 	"strconv"
 	"tiktocker/internal/util"
 	"time"
@@ -44,7 +49,7 @@ type RequestResult struct {
 	Err error
 }
 
-func MikrotikBackup(settings *BackupSettings, deviceComms chan *RequestResult) {
+func MikrotikBackup(ctx *context.Context, settings *BackupSettings, deviceComms chan *RequestResult) {
 	util.Log.Infof("backing up Mikrotik: %s", settings.BaseUrl)
 
 	internalChannel := make(chan *RequestResult) //TODO is this mixing channels normal in go?! change types if so
@@ -54,7 +59,7 @@ func MikrotikBackup(settings *BackupSettings, deviceComms chan *RequestResult) {
 		Timeout: 10 * time.Second,
 	}
 
-	go getIdentity(client, settings, internalChannel)
+	go getIdentity(client, settings, internalChannel) //ctx
 	systemIdentity := <-internalChannel
 	if systemIdentity.Err != nil {
 		deviceComms <- &RequestResult{
@@ -82,7 +87,7 @@ func MikrotikBackup(settings *BackupSettings, deviceComms chan *RequestResult) {
 		return
 	}
 
-	go downloadBackup(client, fileInfoResponse.File.Name, fileInfoResponse.File.Size, settings, internalChannel)
+	go downloadBackup(fileInfoResponse.File.Name, settings, internalChannel, ctx)
 	downloadResponse := <-internalChannel
 	if downloadResponse.Err != nil {
 		deviceComms <- &RequestResult{
@@ -219,61 +224,42 @@ func fileInfo(client *http.Client, identity string, settings *BackupSettings, re
 	results <- &RequestResult{File: BackupFile{Size: size, Name: backupFileName}, Err: nil}
 }
 
-func downloadBackup(client *http.Client, fileName string, fileSize int, settings *BackupSettings, results chan<- *RequestResult) {
-	fileContent := make([]byte, 0)
-	fileReadPath := *settings.BaseUrl
-	fileReadPath.Path = fileReadPath.ResolveReference(&url.URL{Path: FileGetPath}).Path
-	const Offset = "offset"
+func downloadBackup(fileName string, settings *BackupSettings, results chan<- *RequestResult, ctx *context.Context) {
+	//scp file, cannot use Mikrotik's REST API for this due to random encoding returned in json
 
-	body := map[string]interface{}{
-		"file":       fileName,
-		"chunk-size": ChunkSize,
-		Offset:       0,
+	user := settings.BaseUrl.User.Username()
+	pass, _ := settings.BaseUrl.User.Password()
+	host := fmt.Sprintf("%s:22", settings.BaseUrl.Host)
+
+	clientConfig, err := auth.PasswordKey(user, pass, ssh.InsecureIgnoreHostKey())
+	if err != nil {
+		results <- &RequestResult{Err: fmt.Errorf("failed to create SSH config: %v", err)}
+		return
 	}
 
-	fetchChunk := func(offset int) {
-		body[Offset] = offset
-		util.Log.Debugf("requesting backup file chunk at offset %d", offset)
-		resp, err := doRequest(client, &fileReadPath, http.MethodPost, &body)
-		if err != nil {
-			util.Log.Errorf("backup request (offset: %d) failed: %v", offset, err)
-			results <- &RequestResult{Err: err}
-			return
-		}
-		defer resp.Body.Close()
+	// Create SCP client
+	client := scp.NewClient(host, &clientConfig)
+	err = client.Connect()
+	if err != nil {
+		results <- &RequestResult{Err: fmt.Errorf("failed to SSH to: %s, error: %v", host, err)}
+		return
+	}
+	defer client.Close()
 
-		fileData, err := io.ReadAll(resp.Body)
-		if err != nil {
-			util.Log.Errorf("failed to read backup response: %v", err)
-			results <- &RequestResult{Err: err}
-			return
-		}
-		var chunkData []map[string]interface{}
-		if err := json.Unmarshal(fileData, &chunkData); err != nil {
-			util.Log.Errorf("failed to decode backup chunk: %v", err)
-			results <- &RequestResult{Err: err}
-			return
-		}
-		if len(chunkData) > 0 {
-			if dataStr, ok := chunkData[0]["data"].(string); ok {
-				fileContent = append(fileContent, []byte(dataStr)...)
-			}
-		}
+	var buf bytes.Buffer
+
+	err = client.CopyFromRemotePassThru(*ctx, &buf, fileName, nil)
+	if err != nil {
+		results <- &RequestResult{Err: fmt.Errorf("failed to SCP file: %v", err)}
+		return
 	}
 
-	util.Log.Infof("downloading backup file %s of size %d bytes, from: %s", fileName, fileSize, fileReadPath.Host)
-
-	offset := 0
-	done := make(chan bool)
-	for offset < fileSize {
-		go func(off int) {
-			fetchChunk(off)
-			done <- true
-		}(offset)
-		<-done
-		//TODO ASSERT CORRECTNESS OF RESPONSE
-		offset += ChunkSize
+	results <- &RequestResult{
+		File: BackupFile{
+			Name:     fileName,
+			Size:     buf.Len(),
+			Contents: buf.Bytes(),
+		},
+		Err: nil,
 	}
-
-	results <- &RequestResult{File: BackupFile{Contents: fileContent, Size: fileSize, Name: fileName}, Err: nil}
 }

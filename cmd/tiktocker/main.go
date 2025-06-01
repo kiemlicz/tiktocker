@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -44,13 +45,16 @@ func main() {
 	util.Log.Infof("found %d Mikrotik devices to backup (out of: %d)", len(targets), len(config.Mikrotiks))
 
 	for _, settings := range targets {
+		ctx, cancel := context.WithTimeout(context.Background(), settings.Timeout)
+		defer cancel() // todo sth wrong?
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			mainChannel := make(chan *backup.RequestResult) //experiment with moving channel out of this gorouteine
-			//defer close(mainChannel)
+			//defer close(mainChannel) //
 
-			go backup.MikrotikBackup(settings, mainChannel)
+			go backup.MikrotikBackup(&ctx, settings, mainChannel)
 
 			var backupFile *backup.RequestResult
 
@@ -61,7 +65,7 @@ func main() {
 					return
 				}
 
-			case <-time.After(settings.Timeout):
+			case <-ctx.Done():
 				util.Log.Errorf("timeout while waiting for backup %s", settings.BaseUrl.Host)
 				return
 			}
@@ -72,7 +76,7 @@ func main() {
 
 			select {
 			case _ = <-mainChannel:
-			case <-time.After(settings.Timeout):
+			case <-ctx.Done():
 				util.Log.Errorf("timeout while waiting for upload the backup file %s", "TODO")
 				return
 			}
