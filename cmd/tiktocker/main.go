@@ -15,7 +15,12 @@ import (
 )
 
 type Config struct {
-	Mikrotiks map[string]struct {
+	Log struct {
+		Level string `mapstructure:"level"`
+	} `mapstructure:"log"`
+
+	Mikrotiks []struct {
+		Host          string        `mapstructure:"host"`
 		Username      string        `mapstructure:"username"`
 		Password      string        `mapstructure:"password"`
 		EncryptionKey string        `mapstructure:"encryptionKey"`
@@ -30,7 +35,7 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 		return
 	}
-	util.Setup()
+	util.Setup(config.Log.Level)
 	util.Log.Infof("Mikrotik Backup starting")
 
 	var wg sync.WaitGroup
@@ -81,16 +86,16 @@ func main() {
 func createTargets(config *Config) []*backup.BackupSettings {
 	targets := make([]*backup.BackupSettings, 0, len(config.Mikrotiks))
 
-	for host, target := range config.Mikrotiks {
-		util.Log.Infof("Processing Mikrotik %s, values: %s", host, target)
-		u, err := util.CreateUrl(host, target.Username, target.Password)
+	for _, target := range config.Mikrotiks {
+		util.Log.Infof("processing Mikrotik %s, values: %s", target.Host, target)
+		u, err := util.CreateUrl(target.Host, target.Username, target.Password)
 		if err != nil {
-			util.Log.Errorf("failed to create URL for Mikrotik %s: %v", host, err)
+			util.Log.Errorf("failed to create URL for Mikrotik %s: %v", target.Host, err)
 			continue
 		}
 		t, err := url.Parse(target.DownloadTo)
 		if err != nil {
-			util.Log.Errorf("failed to parse download URL for Mikrotik %s: %v", host, err)
+			util.Log.Errorf("failed to parse download URL for Mikrotik %s: %v", target.Host, err)
 			continue
 		}
 		timeout := target.Timeout
@@ -108,25 +113,26 @@ func createTargets(config *Config) []*backup.BackupSettings {
 }
 
 func setupConfig() (*Config, error) {
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath("/etc/tiktocker")
-	viper.AddConfigPath(".")
-	viper.SetEnvPrefix("TT")
-	viper.AutomaticEnv()
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v := viper.New()
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AddConfigPath("/etc/tiktocker")
+	v.AddConfigPath(".")
+	v.SetEnvPrefix("TT")
+	v.AutomaticEnv()
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
-	pflag.String("log.level", "", "Log level (overrides yaml file)")
+	pflag.String("log.level", "", "log level (overrides yaml file)")
 	pflag.Parse()
-	_ = viper.BindPFlags(pflag.CommandLine)
+	_ = v.BindPFlags(pflag.CommandLine)
 
-	err := viper.ReadInConfig()
+	err := v.ReadInConfig()
 	if err != nil {
 		panic(fmt.Errorf("fatal error config file: %s", err))
 	}
 
 	var config *Config
-	err = viper.Unmarshal(&config)
+	err = v.Unmarshal(&config)
 	if err != nil {
 		log.Fatalf("Unable to decode into struct, %v", err)
 		return config, err

@@ -3,8 +3,11 @@
 #  bucket: ""
 #  prefix: ""
 
+log:
+  level: debug
+
 mikrotiks:
-  192.168.1.1:
+  - host: ""
     username: ""
     password: ""
     encryptionKey: ""

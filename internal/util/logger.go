@@ -2,15 +2,13 @@ package util
 
 import (
 	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
 	"strings"
 )
 
 var Log *logrus.Logger
 
-func Setup() {
+func Setup(logLevel string) {
 	Log = logrus.New()
-	logLevel := viper.GetString("Log.level")
 	level, err := logrus.ParseLevel(strings.ToLower(logLevel))
 	if err != nil {
 		Log.Warnf("Invalid Log level in config: %s. Using 'info'.", logLevel)
