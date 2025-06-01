@@ -52,21 +52,21 @@ func main() {
 
 			go backup.MikrotikBackup(settings, mainChannel)
 
-			var backupFile backup.RequestResult
+			var backupFile *backup.RequestResult
 
 			select {
-			case backupFile := <-mainChannel:
+			case backupFile = <-mainChannel:
 				if backupFile.Err != nil {
 					util.Log.Errorf("failed to backup Mikrotik %s: %v", settings.BaseUrl.Host, backupFile.Err)
 					return
 				}
 
 			case <-time.After(settings.Timeout):
-				util.Log.Errorf("timeout while waiting for backup from Mikrotik %s", settings.BaseUrl.Host)
+				util.Log.Errorf("timeout while waiting for backup %s", settings.BaseUrl.Host)
 				return
 			}
 
-			util.Log.Infof("backup file received from Mikrotik %s: %s (%d bytes)", settings.BaseUrl.Host, backupFile.File.Name, len(backupFile.File.Contents))
+			util.Log.Infof("backup file downloaded from %s: %s (%d bytes)", settings.BaseUrl.Host, backupFile.File.Name, len(backupFile.File.Contents))
 
 			go storage.UploadFile(settings, &backupFile.File, mainChannel)
 
@@ -87,7 +87,6 @@ func createTargets(config *Config) []*backup.BackupSettings {
 	targets := make([]*backup.BackupSettings, 0, len(config.Mikrotiks))
 
 	for _, target := range config.Mikrotiks {
-		util.Log.Infof("processing Mikrotik %s, values: %s", target.Host, target)
 		u, err := util.CreateUrl(target.Host, target.Username, target.Password)
 		if err != nil {
 			util.Log.Errorf("failed to create URL for Mikrotik %s: %v", target.Host, err)

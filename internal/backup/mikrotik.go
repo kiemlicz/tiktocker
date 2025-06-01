@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"tiktocker/internal/util"
 	"time"
 )
@@ -155,7 +156,7 @@ func performBackup(client *http.Client, identity string, settings *BackupSetting
 	encrypt := true
 	// If encryption is requested but no key is provided, disable encryption
 	if settings.EncryptionKey == "" {
-		util.Log.Warn("encryption disabled")
+		util.Log.Warnf("encryption disabled for: %s (no encryption key)", identity)
 		encrypt = false
 	}
 
@@ -171,32 +172,26 @@ func performBackup(client *http.Client, identity string, settings *BackupSetting
 	backupRequestUrl.Path = backupRequestUrl.ResolveReference(&url.URL{Path: BackupPath}).Path
 	util.Log.Debugf("requesting backup for %s at %s", identity, backupRequestUrl.String())
 
-	resp, err := doRequest(client, &backupRequestUrl, http.MethodPost, &body)
+	_, err := doRequest(client, &backupRequestUrl, http.MethodPost, &body) // response is an empty array
 	if err != nil {
 		util.Log.Errorf("failed to perform backup: %v", err)
 		results <- &RequestResult{Err: err}
 		return
 	}
 
-	var result map[string]interface{}
-	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(&result); err != nil {
-		util.Log.Errorf("failed to decode backup response: %v", err)
-		results <- &RequestResult{Err: err}
-		return
-	}
 	util.Log.Debugf("backup requested for %s", identity)
 	results <- &RequestResult{Err: nil}
 }
 
 func fileInfo(client *http.Client, identity string, settings *BackupSettings, results chan<- *RequestResult) {
+	backupFileName := fmt.Sprintf("%s.backup", identity)
 	fileInfoRequestUrl := *settings.BaseUrl
 	q := fileInfoRequestUrl.Query()
-	q.Set("name", identity)
+	q.Set("name", backupFileName)
 	fileInfoRequestUrl.RawQuery = q.Encode()
 	fileInfoRequestUrl.Path = fileInfoRequestUrl.ResolveReference(&url.URL{Path: FileInfo}).Path
 
-	util.Log.Infof("requesting backup file info for %s at %s", identity, fileInfoRequestUrl.String())
+	util.Log.Infof("requesting backup file info for %s at %s", backupFileName, fileInfoRequestUrl.String())
 
 	resp, err := doRequest(client, &fileInfoRequestUrl, http.MethodGet, nil)
 	if err != nil {
@@ -213,35 +208,35 @@ func fileInfo(client *http.Client, identity string, settings *BackupSettings, re
 		return
 	}
 	if len(fileInfoList) == 0 {
-		results <- &RequestResult{Err: fmt.Errorf("backup file not found: %s", identity)}
+		results <- &RequestResult{Err: fmt.Errorf("backup file not found: %s", backupFileName)}
 		return
 	}
-	size, ok := fileInfoList[0]["size"].(int)
-	if !ok {
-		results <- &RequestResult{Err: fmt.Errorf("size field not found in file info")}
+	size, err := strconv.Atoi(fileInfoList[0]["size"].(string))
+	if err != nil {
+		results <- &RequestResult{Err: fmt.Errorf("size field not found in file info: %s", fileInfoList[0])}
 		return
 	}
-	results <- &RequestResult{File: BackupFile{Size: size}, Err: nil}
+	results <- &RequestResult{File: BackupFile{Size: size, Name: backupFileName}, Err: nil}
 }
 
 func downloadBackup(client *http.Client, fileName string, fileSize int, settings *BackupSettings, results chan<- *RequestResult) {
 	fileContent := make([]byte, 0)
-	backupFileName := fmt.Sprintf("%s.backup", fileName)
 	fileReadPath := *settings.BaseUrl
 	fileReadPath.Path = fileReadPath.ResolveReference(&url.URL{Path: FileGetPath}).Path
 	const Offset = "offset"
 
 	body := map[string]interface{}{
-		"file":       backupFileName,
+		"file":       fileName,
 		"chunk-size": ChunkSize,
 		Offset:       0,
 	}
 
 	fetchChunk := func(offset int) {
 		body[Offset] = offset
-		resp, err := doRequest(client, &fileReadPath, "POST", &body)
+		util.Log.Debugf("requesting backup file chunk at offset %d", offset)
+		resp, err := doRequest(client, &fileReadPath, http.MethodPost, &body)
 		if err != nil {
-			util.Log.Errorf("Backup request (offset: %d) failed: %v", offset, err)
+			util.Log.Errorf("backup request (offset: %d) failed: %v", offset, err)
 			results <- &RequestResult{Err: err}
 			return
 		}
@@ -249,14 +244,24 @@ func downloadBackup(client *http.Client, fileName string, fileSize int, settings
 
 		fileData, err := io.ReadAll(resp.Body)
 		if err != nil {
-			util.Log.Errorf("Failed to read backup response: %v", err)
+			util.Log.Errorf("failed to read backup response: %v", err)
 			results <- &RequestResult{Err: err}
 			return
 		}
-		fileContent = append(fileContent, fileData...)
+		var chunkData []map[string]interface{}
+		if err := json.Unmarshal(fileData, &chunkData); err != nil {
+			util.Log.Errorf("failed to decode backup chunk: %v", err)
+			results <- &RequestResult{Err: err}
+			return
+		}
+		if len(chunkData) > 0 {
+			if dataStr, ok := chunkData[0]["data"].(string); ok {
+				fileContent = append(fileContent, []byte(dataStr)...)
+			}
+		}
 	}
 
-	util.Log.Infof("Downloading backup file %s of size %d bytes, from: %s", fileName, fileSize, fileReadPath.String())
+	util.Log.Infof("downloading backup file %s of size %d bytes, from: %s", fileName, fileSize, fileReadPath.Host)
 
 	offset := 0
 	done := make(chan bool)
@@ -266,8 +271,9 @@ func downloadBackup(client *http.Client, fileName string, fileSize int, settings
 			done <- true
 		}(offset)
 		<-done
+		//TODO ASSERT CORRECTNESS OF RESPONSE
 		offset += ChunkSize
 	}
 
-	results <- &RequestResult{File: BackupFile{Contents: fileContent, Size: fileSize, Name: backupFileName}, Err: nil}
+	results <- &RequestResult{File: BackupFile{Contents: fileContent, Size: fileSize, Name: fileName}, Err: nil}
 }
