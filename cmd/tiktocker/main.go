@@ -46,39 +46,28 @@ func main() {
 
 	for _, settings := range targets {
 		ctx, cancel := context.WithTimeout(context.Background(), settings.Timeout)
-		defer cancel() // todo sth wrong?
+		defer cancel()
 
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
 			mainChannel := make(chan *backup.RequestResult) //experiment with moving channel out of this gorouteine
-			//defer close(mainChannel) //
+			defer close(mainChannel)
 
 			go backup.MikrotikBackup(&ctx, settings, mainChannel)
-
-			var backupFile *backup.RequestResult
-
-			select {
-			case backupFile = <-mainChannel:
-				if backupFile.Err != nil {
-					util.Log.Errorf("failed to backup Mikrotik %s: %v", settings.BaseUrl.Host, backupFile.Err)
-					return
-				}
-
-			case <-ctx.Done():
-				util.Log.Errorf("timeout while waiting for backup %s", settings.BaseUrl.Host)
+			backupFile, err := util.WaitForResult(ctx, mainChannel)
+			if err != nil || backupFile.Err != nil {
+				util.Log.Errorf("failed to backup Mikrotik %s: %v", settings.BaseUrl.Host, backupFile.Err)
 				return
 			}
 
 			util.Log.Infof("backup file downloaded from %s: %s (%d bytes)", settings.BaseUrl.Host, backupFile.File.Name, len(backupFile.File.Contents))
 
 			go storage.UploadFile(settings, &backupFile.File, mainChannel)
-
-			select {
-			case _ = <-mainChannel:
-			case <-ctx.Done():
-				util.Log.Errorf("timeout while waiting for upload the backup file %s", "TODO")
-				return
+			_, err = util.WaitForResult(ctx, mainChannel)
+			if err != nil {
+				util.Log.Errorf("backup file upload failure")
 			}
 			util.Log.Infof("Mikrotik %s backup completed successfully", settings.BaseUrl.Host)
 		}()
