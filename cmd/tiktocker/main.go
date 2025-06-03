@@ -55,9 +55,9 @@ func main() {
 			mainChannel := make(chan *backup.RequestResult) //experiment with moving channel out of this gorouteine
 			defer close(mainChannel)
 
-			go backup.MikrotikBackup(&ctx, settings, mainChannel)
-			backupFile, err := util.WaitForResult(ctx, mainChannel)
-			if err != nil || backupFile.Err != nil {
+			go backup.MikrotikBackup(ctx, settings, mainChannel)
+			backupFile := backup.WaitForResult(ctx, mainChannel)
+			if backupFile.Err != nil {
 				util.Log.Errorf("failed to backup Mikrotik %s: %v", settings.BaseUrl.Host, backupFile.Err)
 				return
 			}
@@ -65,9 +65,10 @@ func main() {
 			util.Log.Infof("backup file downloaded from %s: %s (%d bytes)", settings.BaseUrl.Host, backupFile.File.Name, len(backupFile.File.Contents))
 
 			go storage.UploadFile(settings, &backupFile.File, mainChannel)
-			_, err = util.WaitForResult(ctx, mainChannel)
-			if err != nil {
+			uploadResult := backup.WaitForResult(ctx, mainChannel)
+			if uploadResult.Err != nil {
 				util.Log.Errorf("backup file upload failure")
+				return
 			}
 			util.Log.Infof("Mikrotik %s backup completed successfully", settings.BaseUrl.Host)
 		}()

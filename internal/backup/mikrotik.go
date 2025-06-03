@@ -12,34 +12,27 @@ import (
 	"net/http"
 	"net/url"
 
-	"strconv"
 	"tiktocker/internal/util"
 	"time"
 )
 
 const (
 	BackupPath     = "rest/system/backup/save"
-	FileGetPath    = "rest/file/read"
 	FileInfo       = "rest/file"
 	SystemIdentity = "rest/system/identity"
 
 	ContentType = "application/json"
-	ChunkSize   = 10 * 1024
 )
 
 type BackupSettings struct {
-	BaseUrl *url.URL
-
+	BaseUrl       *url.URL
 	EncryptionKey string
-
-	DownloadTo *url.URL
-
-	Timeout time.Duration
+	DownloadTo    *url.URL
+	Timeout       time.Duration
 }
 
 type BackupFile struct {
 	Name     string
-	Size     int
 	Contents []byte
 }
 
@@ -49,49 +42,41 @@ type RequestResult struct {
 	Err error
 }
 
-func MikrotikBackup(ctx *context.Context, settings *BackupSettings, deviceComms chan *RequestResult) {
+func MikrotikBackup(ctx context.Context, settings *BackupSettings, deviceComms chan *RequestResult) {
 	util.Log.Infof("backing up Mikrotik: %s", settings.BaseUrl)
 
 	internalChannel := make(chan *RequestResult) //TODO is this mixing channels normal in go?! change types if so
 	//TODO if channel is created outside - what about mixing messages in channel?
+	defer close(internalChannel)
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
 
-	go getIdentity(client, settings, internalChannel) //ctx
-	systemIdentity := <-internalChannel
+	go getIdentity(client, settings, internalChannel)
+	systemIdentity := WaitForResult(ctx, internalChannel)
 	if systemIdentity.Err != nil {
 		deviceComms <- &RequestResult{
-			Err: fmt.Errorf("failed to get system identity: %v", systemIdentity.Err),
+			Err: fmt.Errorf("backup failure: %v", systemIdentity.Err),
 		}
 		return
 	}
 
 	backupName := systemIdentity.File.Name
 	go performBackup(client, backupName, settings, internalChannel)
-	backupResponse := <-internalChannel
+	backupResponse := WaitForResult(ctx, internalChannel)
 	if backupResponse.Err != nil {
 		deviceComms <- &RequestResult{
-			Err: fmt.Errorf("failed to perform backup: %v", backupResponse.Err),
+			Err: fmt.Errorf("backup failure: %v", backupResponse.Err),
 		}
 		return
 	}
 
-	go fileInfo(client, backupName, settings, internalChannel)
-	fileInfoResponse := <-internalChannel
-	if fileInfoResponse.Err != nil {
-		deviceComms <- &RequestResult{
-			Err: fmt.Errorf("failed to get file info: %v", fileInfoResponse.Err),
-		}
-		return
-	}
-
-	go downloadBackup(fileInfoResponse.File.Name, settings, internalChannel, ctx)
-	downloadResponse := <-internalChannel
+	go downloadBackup(ctx, backupResponse.File.Name, settings, internalChannel)
+	downloadResponse := WaitForResult(ctx, internalChannel)
 	if downloadResponse.Err != nil {
 		deviceComms <- &RequestResult{
-			Err: fmt.Errorf("failed to download backup: %v", downloadResponse.Err),
+			Err: fmt.Errorf("backup failure: %v", downloadResponse.Err),
 		}
 		return
 	}
@@ -185,46 +170,10 @@ func performBackup(client *http.Client, identity string, settings *BackupSetting
 	}
 
 	util.Log.Debugf("backup requested for %s", identity)
-	results <- &RequestResult{Err: nil}
+	results <- &RequestResult{File: BackupFile{Name: fmt.Sprintf("%s.backup", identity)}, Err: nil}
 }
 
-func fileInfo(client *http.Client, identity string, settings *BackupSettings, results chan<- *RequestResult) {
-	backupFileName := fmt.Sprintf("%s.backup", identity)
-	fileInfoRequestUrl := *settings.BaseUrl
-	q := fileInfoRequestUrl.Query()
-	q.Set("name", backupFileName)
-	fileInfoRequestUrl.RawQuery = q.Encode()
-	fileInfoRequestUrl.Path = fileInfoRequestUrl.ResolveReference(&url.URL{Path: FileInfo}).Path
-
-	util.Log.Infof("requesting backup file info for %s at %s", backupFileName, fileInfoRequestUrl.String())
-
-	resp, err := doRequest(client, &fileInfoRequestUrl, http.MethodGet, nil)
-	if err != nil {
-		util.Log.Errorf("failed to get file info: %v", err)
-		results <- &RequestResult{Err: err}
-		return
-	}
-
-	var fileInfoList []map[string]interface{}
-	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(&fileInfoList); err != nil {
-		util.Log.Errorf("failed to decode file info response: %v", err)
-		results <- &RequestResult{Err: err}
-		return
-	}
-	if len(fileInfoList) == 0 {
-		results <- &RequestResult{Err: fmt.Errorf("backup file not found: %s", backupFileName)}
-		return
-	}
-	size, err := strconv.Atoi(fileInfoList[0]["size"].(string))
-	if err != nil {
-		results <- &RequestResult{Err: fmt.Errorf("size field not found in file info: %s", fileInfoList[0])}
-		return
-	}
-	results <- &RequestResult{File: BackupFile{Size: size, Name: backupFileName}, Err: nil}
-}
-
-func downloadBackup(fileName string, settings *BackupSettings, results chan<- *RequestResult, ctx *context.Context) {
+func downloadBackup(ctx context.Context, fileName string, settings *BackupSettings, results chan<- *RequestResult) {
 	//scp file, cannot use Mikrotik's REST API for this due to random encoding returned in json
 
 	user := settings.BaseUrl.User.Username()
@@ -237,7 +186,6 @@ func downloadBackup(fileName string, settings *BackupSettings, results chan<- *R
 		return
 	}
 
-	// Create SCP client
 	client := scp.NewClient(host, &clientConfig)
 	err = client.Connect()
 	if err != nil {
@@ -248,7 +196,7 @@ func downloadBackup(fileName string, settings *BackupSettings, results chan<- *R
 
 	var buf bytes.Buffer
 
-	err = client.CopyFromRemotePassThru(*ctx, &buf, fileName, nil)
+	err = client.CopyFromRemotePassThru(ctx, &buf, fileName, nil)
 	if err != nil {
 		results <- &RequestResult{Err: fmt.Errorf("failed to SCP file: %v", err)}
 		return
@@ -257,9 +205,25 @@ func downloadBackup(fileName string, settings *BackupSettings, results chan<- *R
 	results <- &RequestResult{
 		File: BackupFile{
 			Name:     fileName,
-			Size:     buf.Len(),
 			Contents: buf.Bytes(),
 		},
 		Err: nil,
+	}
+}
+
+// WaitForResult waits for a value from the channel or context cancellation.
+func WaitForResult(ctx context.Context, ch <-chan *RequestResult) *RequestResult {
+	var zero *RequestResult
+	select {
+	case v, ok := <-ch:
+		if !ok {
+			zero.Err = fmt.Errorf("channel closed")
+			return zero
+		}
+		return v
+	case <-ctx.Done():
+		util.Log.Debugf("context done: %v", ctx.Err())
+		zero.Err = fmt.Errorf("context done: %v", ctx.Err())
+		return zero
 	}
 }

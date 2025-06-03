@@ -13,6 +13,11 @@ func UploadFile(settings *backup.BackupSettings, file *backup.BackupFile, device
 	case "file":
 		destDir := settings.DownloadTo.Path
 		destPath := filepath.Join(destDir, file.Name)
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			util.Log.Errorf("failed to create directory: %v", err)
+			deviceComms <- &backup.RequestResult{Err: fmt.Errorf("failed to create directory: %w", err)}
+			return
+		}
 		if err := os.WriteFile(destPath, file.Contents, 0644); err != nil {
 			util.Log.Errorf("Failed to save backup to file: %v", err)
 			deviceComms <- &backup.RequestResult{Err: fmt.Errorf("failed to save backup: %w", err)}
