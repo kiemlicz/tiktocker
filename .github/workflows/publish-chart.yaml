@@ -61,7 +61,7 @@ jobs:
       - name: Build and push Helm Chart
         run: |
           VERSION=$(helm show chart deployment/tiktocker | awk -F: '/version: / {gsub(/^[ \t]+/, "", $2); print $2}')
-          REF=oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-chart
+          REF=oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           ARTIFACT="$REF:$VERSION"
           echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
           echo "Publishing: $ARTIFACT"
