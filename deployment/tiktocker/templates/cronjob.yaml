@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "tiktocker.fullname" . }}
+  labels: {{ include "tiktocker.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.tiktocker.schedule }}
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{ toYaml . | nindent 12 }}
+          {{- end }}
+          serviceAccountName: {{ include "tiktocker.fullname" . }}
+          securityContext: {{ toYaml .Values.podSecurityContext | nindent 12 }}
+          restartPolicy: Never
+          containers:
+            - name: {{ .Chart.Name }}
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              restartPolicy: Never
+              securityContext: {{ toYaml .Values.securityContext | nindent 16 }}
+              resources: {{- toYaml .Values.resources | nindent 16 }}
+              volumeMounts:
+                - mountPath: /etc/tiktocker
+                  name: tiktocker
+          volumes:
+            - name: tiktocker-config
+              configMap:
+                name: tiktocker-config
+          nodeSelector: {{ toYaml .Values.nodeSelector | nindent 12 }}
+          affinity: {{ toYaml .Values.affinity | nindent 12 }}
+          tolerations: {{ toYaml .Values.tolerations | nindent 12 }}

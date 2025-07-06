@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	scp "github.com/bramvdbogaerde/go-scp"
+	"github.com/bramvdbogaerde/go-scp"
 	"github.com/bramvdbogaerde/go-scp/auth"
 	"golang.org/x/crypto/ssh"
 	"io"
@@ -24,7 +24,7 @@ const (
 )
 
 func MikrotikBackup(ctx context.Context, settings *common.BackupSettings, deviceComms chan *common.RequestResult) {
-	common.Log.Infof("backing up Mikrotik: %s", settings.BaseUrl)
+	common.Log.Infof("backing up Mikrotik: %s", settings.BaseUrl.Redacted())
 
 	internalChannel := make(chan *common.RequestResult) //TODO is this mixing channels normal in go?! change types if so
 	//TODO if channel is created outside - what about mixing messages in channel?
@@ -119,7 +119,7 @@ func doRequest(client *http.Client, url *url.URL, method string, body *map[strin
 func getIdentity(client *http.Client, settings *common.BackupSettings, results chan<- *common.RequestResult) {
 	identityUrl := *settings.BaseUrl
 	identityUrl.Path = identityUrl.ResolveReference(&url.URL{Path: SystemIdentity}).Path
-	common.Log.Debugf("requesting Mikrotik identity %s", identityUrl.String())
+	common.Log.Debugf("requesting Mikrotik identity %s", identityUrl.Redacted())
 
 	resp, err := doRequest(client, &identityUrl, http.MethodGet, nil)
 	if err != nil {
@@ -159,7 +159,7 @@ func performBackup(client *http.Client, identity string, settings *common.Backup
 
 	backupRequestUrl := *settings.BaseUrl
 	backupRequestUrl.Path = backupRequestUrl.ResolveReference(&url.URL{Path: BackupPath}).Path
-	common.Log.Debugf("requesting backup for %s at %s", identity, backupRequestUrl.String())
+	common.Log.Debugf("requesting backup for %s at %s", identity, backupRequestUrl.Redacted())
 
 	_, err := doRequest(client, &backupRequestUrl, http.MethodPost, &body) // response is an empty array
 	if err != nil {

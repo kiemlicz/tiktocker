@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tiktocker-config
+data:
+  config.yaml: |
+    log:
+      level: {{ default "warn" .Values.tiktocker.logLevel }}
+
+    directory: "{{ default "" .Values.tiktocker.directory }}"
+
+    s3: {{ .Values.tiktocker.s3 | toYaml | nindent 6 }}
+
+    mikrotiks: {{ .Values.tiktocker.mikrotiks | toYaml | nindent 6 }}

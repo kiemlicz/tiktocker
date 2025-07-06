@@ -3,14 +3,14 @@ package storage
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
-	"net/url"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"os"
 	"path/filepath"
 	"tiktocker/internal/common"
 
 	"crypto/sha256"
-	"encoding/hex"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,83 +18,74 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-func UploadFile(ctx context.Context, s3Client *s3.Client, settings *common.BackupSettings, file *common.BackupFile, mainComms chan *common.UploadResult) {
-	switch settings.DownloadTo.Scheme {
-	case "file":
-		destDir := settings.DownloadTo.Path
-		destPath := filepath.Join(destDir, file.Name)
-		if err := os.MkdirAll(destDir, 0755); err != nil {
-			common.Log.Errorf("failed to create directory: %v", err)
-			mainComms <- &common.UploadResult{Err: fmt.Errorf("failed to create directory: %w", err)}
-			return
-		}
-		if err := os.WriteFile(destPath, file.Contents, 0644); err != nil {
-			common.Log.Errorf("Failed to save backup to file: %v", err)
-			mainComms <- &common.UploadResult{Err: fmt.Errorf("failed to save backup: %w", err)}
-			return
-		}
-		common.Log.Infof("backup saved to %s", destPath)
-
-	case "s3", "": // meh this alternative
-		err := uploadToS3(ctx, s3Client, settings.DownloadTo, file)
-		if err != nil {
-			common.Log.Errorf("failed to upload to S3: %v", err)
-			mainComms <- &common.UploadResult{Err: fmt.Errorf("failed to upload to S3: %w", err)}
-			return
-		}
-		common.Log.Infof("backup uploaded to S3")
-
-	default:
-		common.Log.Warnf("unsupported upload scheme: %s", settings.DownloadTo.Scheme)
-		mainComms <- &common.UploadResult{Err: fmt.Errorf("unsupported upload scheme: %s", settings.DownloadTo.Scheme)}
+func StoreFile(
+	destDir string,
+	file *common.BackupFile,
+	mainComms chan *common.UploadResult,
+) {
+	destPath := filepath.Join(destDir, file.Name)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		common.Log.Errorf("failed to create directory: %v", err)
+		mainComms <- &common.UploadResult{Err: fmt.Errorf("failed to create directory: %w", err)}
 		return
 	}
-
-	mainComms <- &common.UploadResult{Err: nil}
+	if err := os.WriteFile(destPath, file.Contents, 0644); err != nil {
+		common.Log.Errorf("Failed to save backup to file: %v", err)
+		mainComms <- &common.UploadResult{Err: fmt.Errorf("failed to save backup: %w", err)}
+		return
+	}
+	common.Log.Infof("backup saved to %s", destPath)
+	mainComms <- &common.UploadResult{}
 }
 
-func uploadToS3(ctx context.Context, s3Client *s3.Client, DownloadTo *url.URL, file *common.BackupFile) error {
-	// Parse bucket and bucketPath from settings.DownloadTo
-	// s3://host/bucket/prefix/filename
-	parts := strings.SplitN(strings.TrimPrefix(DownloadTo.Path, "/"), "/", 2)
-	if len(parts) < 2 {
-		return fmt.Errorf("invalid S3 scheme's path: %s, must have at least two segments", DownloadTo.String())
-	}
-	bucket := parts[0]
-	bucketPath := parts[1]
+func UploadFile(
+	ctx context.Context,
+	s3Client *common.S3Connector,
+	file *common.BackupFile,
+	mainComms chan *common.UploadResult,
+) {
+	bucket := s3Client.Bucket
+	bucketPath := s3Client.Prefix
 	if !strings.HasSuffix(bucketPath, file.Name) {
 		bucketPath = filepath.Join(bucketPath, file.Name)
 	}
 
 	// Compute local checksum
 	localSum := sha256.Sum256(file.Contents)
-	localSumHex := hex.EncodeToString(localSum[:])
+	localSumBase64 := base64.StdEncoding.EncodeToString(localSum[:])
 
 	// Check remote object's checksum (if exists)
-	head, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(bucketPath),
+	head, err := s3Client.Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket:       aws.String(bucket),
+		Key:          aws.String(bucketPath),
+		ChecksumMode: types.ChecksumModeEnabled, //otherwise won't fetch the checksum
 	})
-	if err == nil {
-		remoteSum := head.Metadata["Sha256sum"]
-		if remoteSum == localSumHex {
-			common.Log.Infof("S3 object %s/%s already up-to-date (checksum match)", bucket, bucketPath)
-			return nil
+	if err == nil && head.ChecksumSHA256 != nil {
+		remoteSumBase64 := head.ChecksumSHA256
+		if localSumBase64 == *remoteSumBase64 {
+			common.Log.Infof("s3 object %s/%s already up-to-date (checksum match)", bucket, bucketPath)
+			mainComms <- &common.UploadResult{Err: nil}
+			return
 		}
+		// mikrotik backup almost always differs...
 	} else {
-		common.Log.Debugf("S3 object %s/%s does not exist or error occurred: %v, proceeding", bucket, bucketPath, err)
+		common.Log.Debugf("s3 object %s/%s does not exist or error occurred: %v, proceeding", bucket, bucketPath, err)
 	}
 
-	// Upload with checksum in metadata
-	uploader := manager.NewUploader(s3Client)
+	uploader := manager.NewUploader(s3Client.Client)
 	_, err = uploader.Upload(ctx, &s3.PutObjectInput{
-		Bucket:   aws.String(bucket),
-		Key:      aws.String(bucketPath),
-		Body:     bytes.NewReader(file.Contents),
-		Metadata: map[string]string{"Sha256sum": localSumHex},
+		Bucket:            aws.String(bucket),
+		Key:               aws.String(bucketPath),
+		Body:              bytes.NewReader(file.Contents),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+		ChecksumSHA256:    aws.String(localSumBase64),
 	})
+
 	if err != nil {
-		return fmt.Errorf("bucket: %s upload failure: %w", bucket, err)
+		mainComms <- &common.UploadResult{Err: fmt.Errorf("s3 bucket: %s upload failure: %w", bucket, err)}
+		return
 	}
-	return nil
+
+	common.Log.Infof("backup uploaded to S3")
+	mainComms <- &common.UploadResult{Err: nil}
 }

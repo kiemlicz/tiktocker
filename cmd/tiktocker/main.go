@@ -9,7 +9,6 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"log"
-	"net/url"
 	"strings"
 	"sync"
 	"tiktocker/internal/backup"
@@ -19,12 +18,15 @@ import (
 )
 
 type Config struct {
+	Directory string `mapstructure:"directory"` // directory to store backups, if empty - uses S3
+
 	S3 struct {
-		Host      string `mapstructure:"host"`
-		AccessKey string `mapstructure:"accessKey"`
-		SecretKey string `mapstructure:"secretKey"`
-		Region    string `mapstructure:"region"`
-		// fixme add full path here
+		Host         string `mapstructure:"host"`
+		AccessKey    string `mapstructure:"accessKey"`
+		SecretKey    string `mapstructure:"secretKey"`
+		Region       string `mapstructure:"region"`
+		Path         string `mapstructure:"path"`         // bucket/pathPrefix
+		UsePathStyle bool   `mapstructure:"usePathStyle"` // ex Minio uses path style, AWS S3 does not
 	} `mapstructure:"s3"`
 
 	Log struct {
@@ -36,7 +38,6 @@ type Config struct {
 		Username      string        `mapstructure:"username"`
 		Password      string        `mapstructure:"password"`
 		EncryptionKey string        `mapstructure:"encryptionKey"`
-		DownloadTo    string        `mapstructure:"downloadTo"`
 		Timeout       time.Duration `mapstructure:"timeout"`
 	} `mapstructure:"mikrotiks"`
 }
@@ -51,13 +52,18 @@ func main() {
 	common.Log.Infof("Mikrotik Backup starting")
 
 	mainCtx := context.Background()
+
+	var s3Connector *common.S3Connector
 	var wg sync.WaitGroup
 	targets := createTargets(ttConfig)
-	//fixme validate that any target contains s3, otherwise don't require s3client
-	s3Client, err := createS3Client(ttConfig)
-	if err != nil {
-		common.Log.Fatalf("failed to create S3 client: %v", err)
-		return
+
+	localPathDownload := ttConfig.Directory
+	if localPathDownload == "" {
+		s3Connector, err = createS3Client(ttConfig)
+		if err != nil {
+			common.Log.Fatalf("failed to create S3 client: %v", err)
+			return
+		}
 	}
 
 	common.Log.Infof("found %d Mikrotik devices to backup (out of: %d)", len(targets), len(ttConfig.Mikrotiks))
@@ -90,12 +96,15 @@ func main() {
 
 			mainUploadChannel := make(chan *common.UploadResult) //experiment with moving channel out of this gorouteine
 			defer close(mainUploadChannel)
-			go storage.UploadFile(ctx, s3Client, settings, &backupFile.File, mainUploadChannel)
+
+			if localPathDownload != "" {
+				go storage.StoreFile(localPathDownload, &backupFile.File, mainUploadChannel)
+			} else {
+				go storage.UploadFile(ctx, s3Connector, &backupFile.File, mainUploadChannel)
+			}
 			uploadResult, err := common.WaitForResult(ctx, mainUploadChannel)
 			if err != nil {
-				mainUploadChannel <- &common.UploadResult{
-					Err: fmt.Errorf("ctx cancelled, backup failure: %v", err),
-				}
+				common.Log.Errorf("ctx cancelled, backup failure: %v", err)
 				return
 			}
 			if uploadResult.Err != nil {
@@ -109,11 +118,20 @@ func main() {
 	wg.Wait()
 }
 
-func createS3Client(c *Config) (*s3.Client, error) {
+func createS3Client(c *Config) (*common.S3Connector, error) {
 	s3Region := c.S3.Region
 	s3AccessKey := c.S3.AccessKey
 	s3SecretKey := c.S3.SecretKey
 	s3Host := c.S3.Host
+	s3BucketPrefix := c.S3.Path
+	s3PathStyle := c.S3.UsePathStyle
+
+	bucketPrefix := strings.SplitN(strings.TrimPrefix(s3BucketPrefix, "/"), "/", 2)
+	if (len(bucketPrefix) < 2) || (bucketPrefix[0] == "" || bucketPrefix[1] == "") {
+		return nil, fmt.Errorf("invalid S3 path: %s, must be in format bucket/prefix", s3BucketPrefix)
+	}
+	bucket := bucketPrefix[0]
+	bucketPath := bucketPrefix[1]
 
 	cfg := aws.Config{
 		Region:       s3Region,
@@ -121,13 +139,17 @@ func createS3Client(c *Config) (*s3.Client, error) {
 		Credentials:  credentials.NewStaticCredentialsProvider(s3AccessKey, s3SecretKey, ""),
 	}
 
-	client := s3.NewFromConfig(
-		cfg,
-		func(o *s3.Options) {
-			o.UsePathStyle = true // Use path-style URLs for S3
-		},
-	)
-	return client, nil
+	connector := &common.S3Connector{
+		Client: s3.NewFromConfig(
+			cfg,
+			func(o *s3.Options) {
+				o.UsePathStyle = s3PathStyle
+			},
+		),
+		Bucket: bucket,
+		Prefix: bucketPath,
+	}
+	return connector, nil
 }
 
 func createTargets(config *Config) []*common.BackupSettings {
@@ -139,11 +161,6 @@ func createTargets(config *Config) []*common.BackupSettings {
 			common.Log.Errorf("failed to create URL for Mikrotik %s: %v", target.Host, err)
 			continue
 		}
-		t, err := url.Parse(target.DownloadTo)
-		if err != nil {
-			common.Log.Errorf("failed to parse download URL for Mikrotik %s: %v", target.Host, err)
-			continue
-		}
 		timeout := target.Timeout
 		if timeout == 0 {
 			timeout = 10 * time.Second // Default timeout if not set
@@ -152,7 +169,6 @@ func createTargets(config *Config) []*common.BackupSettings {
 		targets = append(targets, &common.BackupSettings{
 			BaseUrl:       u,
 			EncryptionKey: target.EncryptionKey,
-			DownloadTo:    t,
 			Timeout:       timeout,
 		})
 	}
@@ -163,8 +179,8 @@ func setupConfig() (*Config, error) {
 	v := viper.New()
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
-	v.AddConfigPath("/etc/tiktocker")
 	v.AddConfigPath(".")
+	v.AddConfigPath("/etc/tiktocker")
 	v.SetEnvPrefix("TT")
 	v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))

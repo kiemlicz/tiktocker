@@ -1,14 +1,19 @@
-#s3:
-#  host: ""
-#  bucket: ""
-#  prefix: ""
-
 log:
-  level: debug
+  level: warn
+
+directory: ""
+
+s3:
+  host: ""
+  accessKey: ""
+  secretKey: ""
+  region: ""
+  path: ""
+  usePathStyle: true
 
 mikrotiks:
   - host: ""
     username: ""
     password: ""
     encryptionKey: ""
-    downloadTo: "file:///tmp/" # s3://host/bucket/prefix/ file://local/path/
+    # todo add labels for metadata
