@@ -61,9 +61,9 @@ jobs:
       - name: Build and push Helm Chart
         run: |
           VERSION=$(helm show chart deployment/tiktocker | awk -F: '/version: / {gsub(/^[ \t]+/, "", $2); print $2}')
-          ARTIFACT="oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-chart:$VERSION"
+          ARTIFACT="oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION"
           echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
           echo "Publishing: $ARTIFACT"
           helm package deployment/tiktocker --destination . --version $VERSION
-          helm push tiktocker-$VERSION.tgz $ARTIFACT
+          helm push tiktocker-$VERSION.tgz oci://${{ env.REGISTRY }}/
           echo "Publishing completed"
