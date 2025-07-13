@@ -20,7 +20,6 @@ spec:
             - name: {{ .Chart.Name }}
               image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
-              restartPolicy: Never
               securityContext: {{ toYaml .Values.securityContext | nindent 16 }}
               resources: {{- toYaml .Values.resources | nindent 16 }}
               volumeMounts:
