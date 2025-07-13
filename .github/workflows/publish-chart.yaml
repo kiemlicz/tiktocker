@@ -65,7 +65,7 @@ jobs:
         run: |
           VERSION=$(helm show chart deployment/tiktocker | awk -F: '/version: / {gsub(/^[ \t]+/, "", $2); print $2}')
           APP_VERSION="${{ steps.meta.outputs.version }}"
-          REF=oci://${{ env.REGISTRY }}/charts
+          REF=oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           ARTIFACT="$REF:$VERSION"
           echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
           if [ "$APP_VERSION" != "master" ]; then
