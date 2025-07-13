@@ -65,13 +65,16 @@ jobs:
         run: |
           VERSION=$(helm show chart deployment/tiktocker | awk -F: '/version: / {gsub(/^[ \t]+/, "", $2); print $2}')
           APP_VERSION="${{ steps.meta.outputs.version }}"
-          REF=oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          REF=oci://${{ env.REGISTRY }}/charts
           ARTIFACT="$REF:$VERSION"
           echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
           if [ "$APP_VERSION" != "master" ]; then
-            echo "Publishing: $ARTIFACT"
-            helm package deployment/tiktocker --destination . --version $VERSION --app-version "$APP_VERSION"
-            helm push tiktocker-$VERSION.tgz $REF
-            echo "Publishing Chart completed" 
+            echo "Publishing Chart: $ARTIFACT for new image: $APP_VERSION"
+          else
+            helm pull $REF -d /tmp
+            VERSION=$(helm show chart /tmp/tiktocker*.tgz | awk -F: '/version: / {gsub(/^[ \t]+/, "", $2); print $2}')
+            echo "Publishing Chart: $ARTIFACT for last known released version: $VERSION"
           fi
-          # todo publish `master` image's chart too
+          helm package deployment/tiktocker --destination . --version $VERSION --app-version "$APP_VERSION"
+          helm push tiktocker-$VERSION.tgz $REF
+          echo "Publishing Chart completed" 
