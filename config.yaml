@@ -16,4 +16,4 @@ mikrotiks:
     username: ""
     password: ""
     encryptionKey: ""
-    # todo add labels for metadata
+    metadata: {}

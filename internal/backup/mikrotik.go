@@ -13,51 +13,63 @@ import (
 	"net/url"
 
 	"tiktocker/internal/common"
-	"time"
 )
 
 const (
 	BackupPath     = "rest/system/backup/save"
 	SystemIdentity = "rest/system/identity"
+	ExportPath     = "rest/export"
 
 	ContentType = "application/json"
 )
 
-func MikrotikBackup(ctx context.Context, settings *common.BackupSettings, deviceComms chan *common.RequestResult) {
-	common.Log.Infof("backing up Mikrotik: %s", settings.BaseUrl.Redacted())
-
-	internalChannel := make(chan *common.RequestResult) //TODO is this mixing channels normal in go?! change types if so
-	//TODO if channel is created outside - what about mixing messages in channel?
+func MikrotikConfigExport(ctx context.Context, settings *common.BackupSettings, httpClient *http.Client, deviceComms chan *common.RequestResult) {
+	internalChannel := make(chan *common.RequestResult)
 	defer close(internalChannel)
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
+	go getIdentity(httpClient, settings, internalChannel)
+	systemIdentityResponse := common.WaitForResult(ctx, internalChannel)
+	if systemIdentityResponse.Err != nil {
+		deviceComms <- &common.RequestResult{
+			Err: fmt.Errorf("backup failure: %v", systemIdentityResponse.Err),
+		}
+		return
+	}
+	identity := systemIdentityResponse.MikrotikIdentity
+
+	go exportConfig(httpClient, identity, settings, internalChannel)
+	exportConfigResponse := common.WaitForResult(ctx, internalChannel)
+	if exportConfigResponse.Err != nil {
+		deviceComms <- &common.RequestResult{
+			Err: fmt.Errorf("backup failure: %v", exportConfigResponse.Err),
+		}
+		return
+	}
+	exportConfigName := exportConfigResponse.File.Name
+
+	go downloadFile(ctx, exportConfigName, settings, internalChannel)
+	configDownloadResponse := common.WaitForResult(ctx, internalChannel)
+	if configDownloadResponse.Err != nil {
+		deviceComms <- &common.RequestResult{
+			Err: fmt.Errorf("backup failure: %v", configDownloadResponse.Err),
+		}
+		return
 	}
 
-	go getIdentity(client, settings, internalChannel)
-	systemIdentity, err := common.WaitForResult(ctx, internalChannel)
-	if err != nil {
-		deviceComms <- &common.RequestResult{
-			Err: fmt.Errorf("ctx cancelled, backup failure: %v", err),
-		}
-		return
+	deviceComms <- &common.RequestResult{
+		MikrotikIdentity: identity,
+		File:             configDownloadResponse.File,
 	}
-	if systemIdentity.Err != nil {
-		deviceComms <- &common.RequestResult{
-			Err: fmt.Errorf("backup failure: %v", systemIdentity.Err),
-		}
-		return
-	}
+}
 
-	backupName := systemIdentity.File.Name
-	go performBackup(client, backupName, settings, internalChannel)
-	backupResponse, err := common.WaitForResult(ctx, internalChannel)
-	if err != nil {
-		deviceComms <- &common.RequestResult{
-			Err: fmt.Errorf("ctx cancelled, backup failure: %v", err),
-		}
-		return
-	}
+func MikrotikBackup(ctx context.Context, identity string, settings *common.BackupSettings, httpClient *http.Client, deviceComms chan *common.RequestResult) {
+	common.Log.Infof("backing up Mikrotik: %s", settings.BaseUrl.Redacted())
+
+	internalChannel := make(chan *common.RequestResult)
+	defer close(internalChannel)
+
+	go performBackup(httpClient, identity, settings, internalChannel)
+	backupResponse := common.WaitForResult(ctx, internalChannel)
 	if backupResponse.Err != nil {
 		deviceComms <- &common.RequestResult{
 			Err: fmt.Errorf("backup failure: %v", backupResponse.Err),
@@ -65,22 +77,16 @@ func MikrotikBackup(ctx context.Context, settings *common.BackupSettings, device
 		return
 	}
 
-	go downloadBackup(ctx, backupResponse.File.Name, settings, internalChannel)
-	downloadResponse, err := common.WaitForResult(ctx, internalChannel)
-	if err != nil {
+	go downloadFile(ctx, backupResponse.File.Name, settings, internalChannel)
+	backupDownloadResponse := common.WaitForResult(ctx, internalChannel)
+	if backupDownloadResponse.Err != nil {
 		deviceComms <- &common.RequestResult{
-			Err: fmt.Errorf("ctx cancelled, backup failure: %v", err),
-		}
-		return
-	}
-	if downloadResponse.Err != nil {
-		deviceComms <- &common.RequestResult{
-			Err: fmt.Errorf("backup failure: %v", downloadResponse.Err),
+			Err: fmt.Errorf("backup failure: %v", backupDownloadResponse.Err),
 		}
 		return
 	}
 
-	deviceComms <- downloadResponse
+	deviceComms <- backupDownloadResponse
 }
 
 func doRequest(client *http.Client, url *url.URL, method string, body *map[string]interface{}) (*http.Response, error) {
@@ -137,11 +143,38 @@ func getIdentity(client *http.Client, settings *common.BackupSettings, results c
 	}
 
 	common.Log.Debugf("discovered Mikrotik identity: %s", systemIdentity["name"])
-	results <- &common.RequestResult{File: common.BackupFile{Name: systemIdentity["name"]}, Err: nil}
+	results <- &common.RequestResult{
+		MikrotikIdentity: systemIdentity["name"],
+		File:             common.BackupFile{Name: systemIdentity["name"]},
+		Err:              nil,
+	}
+}
+
+func exportConfig(client *http.Client, identity string, settings *common.BackupSettings, results chan<- *common.RequestResult) {
+	exportUrl := *settings.BaseUrl
+	exportUrl.Path = exportUrl.ResolveReference(&url.URL{Path: ExportPath}).Path
+	common.Log.Debugf("exporting Mikrotik: %s configuration (this is not a backup)", identity)
+	exportFileName := fmt.Sprintf("%s.config.rsc", identity)
+	body := map[string]interface{}{
+		"file": exportFileName,
+	}
+	_, err := doRequest(client, &exportUrl, http.MethodPost, &body)
+	if err != nil {
+		common.Log.Errorf("failed to export config: %v", err)
+		results <- &common.RequestResult{Err: err}
+		return
+	}
+	common.Log.Debugf("configuration export requested for %s", identity)
+	results <- &common.RequestResult{MikrotikIdentity: identity, File: common.BackupFile{Name: exportFileName}, Err: nil}
 }
 
 // selecting encryption without password has the same effect as selecting no encryption
-func performBackup(client *http.Client, identity string, settings *common.BackupSettings, results chan<- *common.RequestResult) {
+func performBackup(
+	client *http.Client,
+	identity string,
+	settings *common.BackupSettings,
+	results chan<- *common.RequestResult,
+) {
 	encrypt := true
 	// If encryption is requested but no key is provided, disable encryption
 	if settings.EncryptionKey == "" {
@@ -169,10 +202,11 @@ func performBackup(client *http.Client, identity string, settings *common.Backup
 	}
 
 	common.Log.Debugf("backup requested for %s", identity)
-	results <- &common.RequestResult{File: common.BackupFile{Name: fmt.Sprintf("%s.backup", identity)}, Err: nil}
+	backupFileName := fmt.Sprintf("%s.backup", identity)
+	results <- &common.RequestResult{MikrotikIdentity: identity, File: common.BackupFile{Name: backupFileName}, Err: nil}
 }
 
-func downloadBackup(ctx context.Context, fileName string, settings *common.BackupSettings, results chan<- *common.RequestResult) {
+func downloadFile(ctx context.Context, fileName string, settings *common.BackupSettings, results chan<- *common.RequestResult) {
 	//scp file, cannot use Mikrotik's REST API for this due to random encoding returned in json
 
 	user := settings.BaseUrl.User.Username()
@@ -201,10 +235,20 @@ func downloadBackup(ctx context.Context, fileName string, settings *common.Backu
 		return
 	}
 
+	contents := buf.Bytes()
+	firstNl := bytes.IndexByte(contents, '\n')
+	sha256WithoutFirstLine := ""
+	if firstNl >= 0 {
+		// Skip date from the first line
+		sha256WithoutFirstLine = common.ComputeSha256(contents[firstNl+1:])
+	}
+
 	results <- &common.RequestResult{
 		File: common.BackupFile{
-			Name:     fileName,
-			Contents: buf.Bytes(),
+			Name:                           fileName,
+			Contents:                       contents,
+			ComputedSha256:                 common.ComputeSha256(contents),
+			ComputedSha256WithoutFirstLine: sha256WithoutFirstLine,
 		},
 		Err: nil,
 	}

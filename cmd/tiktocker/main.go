@@ -9,6 +9,8 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"log"
+	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"tiktocker/internal/backup"
@@ -34,11 +36,12 @@ type Config struct {
 	} `mapstructure:"log"`
 
 	Mikrotiks []struct {
-		Host          string        `mapstructure:"host"`
-		Username      string        `mapstructure:"username"`
-		Password      string        `mapstructure:"password"`
-		EncryptionKey string        `mapstructure:"encryptionKey"`
-		Timeout       time.Duration `mapstructure:"timeout"`
+		Host          string            `mapstructure:"host"`
+		Username      string            `mapstructure:"username"`
+		Password      string            `mapstructure:"password"`
+		EncryptionKey string            `mapstructure:"encryptionKey"`
+		Timeout       time.Duration     `mapstructure:"timeout"`
+		Metadata      map[string]string `mapstructure:"metadata"`
 	} `mapstructure:"mikrotiks"`
 }
 
@@ -78,40 +81,73 @@ func main() {
 			defer wg.Done()
 			mainBackupChannel := make(chan *common.RequestResult) //experiment with moving channel out of this gorouteine
 			defer close(mainBackupChannel)
+			client := &http.Client{
+				Timeout: 10 * time.Second,
+			}
 
-			go backup.MikrotikBackup(ctx, settings, mainBackupChannel)
-			backupFile, err := common.WaitForResult(ctx, mainBackupChannel)
-			if err != nil {
-				mainBackupChannel <- &common.RequestResult{
-					Err: fmt.Errorf("ctx cancelled, backup failure: %v", err),
+			go backup.MikrotikConfigExport(ctx, settings, client, mainBackupChannel)
+			configFileResult := common.WaitForResult(ctx, mainBackupChannel)
+			if configFileResult.Err != nil {
+				common.Log.Errorf("failed to download Mikrotik %s config: %v", settings.BaseUrl.Host, configFileResult.Err)
+				return
+			}
+
+			if s3Connector != nil {
+				go func() {
+					mainBackupChannel <- &common.RequestResult{
+						MikrotikIdentity:     configFileResult.MikrotikIdentity,
+						ExistingConfigSha256: s3Connector.GetObjectSha256(ctx, configFileResult.File.Name),
+					}
+				}()
+				s3MetadataResult := common.WaitForResult(ctx, mainBackupChannel)
+				configFileResult.ExistingConfigSha256 = s3MetadataResult.ExistingConfigSha256
+			}
+
+			if configFileResult.ShouldPerformNewBackup() {
+				common.Log.Infof("Mikrotik (host: %s, identity: %s) config has changed, proceeding with backup", settings.BaseUrl.Host, configFileResult.MikrotikIdentity)
+
+				go backup.MikrotikBackup(ctx, configFileResult.MikrotikIdentity, settings, client, mainBackupChannel)
+				backupFileResult := common.WaitForResult(ctx, mainBackupChannel)
+				if backupFileResult.Err != nil {
+					common.Log.Errorf("failed to backup Mikrotik %s: %v", settings.BaseUrl.Host, backupFileResult.Err)
+					return
 				}
-				return
-			}
-			if backupFile.Err != nil {
-				common.Log.Errorf("failed to backup Mikrotik %s: %v", settings.BaseUrl.Host, backupFile.Err)
-				return
-			}
 
-			common.Log.Infof("backup file downloaded from %s: %s (%d bytes)", settings.BaseUrl.Host, backupFile.File.Name, len(backupFile.File.Contents))
+				common.Log.Infof("backup file downloaded from %s: %s (%d bytes)", settings.BaseUrl.Host, backupFileResult.File.Name, len(backupFileResult.File.Contents))
+				if s3Connector != nil {
+					go storage.UploadFile(ctx, s3Connector, &configFileResult.File, &settings.Metadata, mainBackupChannel)
+					configFileUploadResult := common.WaitForResult(ctx, mainBackupChannel)
+					if configFileUploadResult.Err != nil {
+						common.Log.Errorf("config file upload failure: %v", configFileUploadResult.Err)
+						return
+					}
 
-			mainUploadChannel := make(chan *common.UploadResult) //experiment with moving channel out of this gorouteine
-			defer close(mainUploadChannel)
+					go storage.UploadFile(ctx, s3Connector, &backupFileResult.File, &settings.Metadata, mainBackupChannel)
+					backupUploadResult := common.WaitForResult(ctx, mainBackupChannel)
+					if backupUploadResult.Err != nil {
+						common.Log.Errorf("backup file upload failure: %v", backupUploadResult.Err)
+						return
+					}
+				} else {
+					go storage.StoreFile(localPathDownload, &configFileResult.File, mainBackupChannel)
+					storeResult := common.WaitForResult(ctx, mainBackupChannel)
+					if storeResult.Err != nil {
+						common.Log.Errorf("config file upload failure: %v", storeResult.Err)
+						return
+					}
 
-			if localPathDownload != "" {
-				go storage.StoreFile(localPathDownload, &backupFile.File, mainUploadChannel)
+					go storage.StoreFile(localPathDownload, &backupFileResult.File, mainBackupChannel)
+					storeResult = common.WaitForResult(ctx, mainBackupChannel)
+					if storeResult.Err != nil {
+						common.Log.Errorf("backup file upload failure: %v", storeResult.Err)
+						return
+					}
+					common.Log.Infof("Mikrotik %s backup completed successfully", settings.BaseUrl.Host)
+				}
 			} else {
-				go storage.UploadFile(ctx, s3Connector, &backupFile.File, mainUploadChannel)
-			}
-			uploadResult, err := common.WaitForResult(ctx, mainUploadChannel)
-			if err != nil {
-				common.Log.Errorf("ctx cancelled, backup failure: %v", err)
+				common.Log.Infof("Mikrotik (host: %s, identity: %s) config has not changed, skipping backup", settings.BaseUrl.Host, configFileResult.MikrotikIdentity)
 				return
 			}
-			if uploadResult.Err != nil {
-				common.Log.Errorf("backup file upload failure")
-				return
-			}
-			common.Log.Infof("Mikrotik %s backup completed successfully", settings.BaseUrl.Host)
 		}()
 	}
 
@@ -170,6 +206,7 @@ func createTargets(config *Config) []*common.BackupSettings {
 			BaseUrl:       u,
 			EncryptionKey: target.EncryptionKey,
 			Timeout:       timeout,
+			Metadata:      target.Metadata,
 		})
 	}
 	return targets
@@ -177,25 +214,33 @@ func createTargets(config *Config) []*common.BackupSettings {
 
 func setupConfig() (*Config, error) {
 	v := viper.New()
-	v.SetConfigName("config")
-	v.SetConfigType("yaml")
-	v.AddConfigPath(".")
-	v.AddConfigPath("/etc/tiktocker")
 	v.SetEnvPrefix("TT")
 	v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.SetConfigFile("config.yaml") // default config file full path, not adding paths as they pick single file
 
 	pflag.String("log.level", "", "log level (overrides yaml file)")
 	pflag.Parse()
 	_ = v.BindPFlags(pflag.CommandLine)
 
-	err := v.ReadInConfig()
-	if err != nil {
-		panic(fmt.Errorf("fatal error config file: %s", err))
+	if err := v.ReadInConfig(); err != nil {
+		panic(fmt.Errorf("error reading config file, %s", err))
 	}
 
+	loader := func(configFullPath string) {
+		if _, err := os.Stat(configFullPath); err == nil {
+			v.SetConfigFile(configFullPath)
+			if err := v.MergeInConfig(); err != nil {
+				panic(fmt.Errorf("error merging config file, %s", err))
+			}
+		}
+	}
+
+	loader("/etc/tiktocker/config.yaml")
+	loader(".local/config.yaml")
+
 	var config *Config
-	err = v.Unmarshal(&config)
+	err := v.Unmarshal(&config)
 	if err != nil {
 		log.Fatalf("Unable to decode into struct, %v", err)
 		return config, err
