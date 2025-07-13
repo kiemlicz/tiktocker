@@ -6,4 +6,4 @@ type: application
 
 version: 0.0.3
 
-appVersion: 0.0.1 # automatically set by GitHub Actions
+appVersion: 0.0.1 # don't change, automatically set by GitHub Actions
