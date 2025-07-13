@@ -68,8 +68,8 @@ jobs:
           REF=oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           ARTIFACT="$REF:$VERSION"
           echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
-          echo "Publishing: $ARTIFACT"
           if [ "$APP_VERSION" != "master" ]; then
+            echo "Publishing: $ARTIFACT"
             helm package deployment/tiktocker --destination . --version $VERSION --app-version "$APP_VERSION"
             helm push tiktocker-$VERSION.tgz $REF
             echo "Publishing Chart completed" 
