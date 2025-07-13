@@ -1,7 +1,7 @@
 apiVersion: v2
 
 name: tiktocker
-description: Tiktocker - backup Mikrotik configs to S3
+description: TikTocker - backup Mikrotik configs to S3
 type: application
 
 version: 0.0.3

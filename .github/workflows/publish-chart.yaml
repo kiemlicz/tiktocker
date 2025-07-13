@@ -76,6 +76,6 @@ jobs:
             APP_VERSION=$(helm show chart /tmp/tiktocker*.tgz | awk -F: '/appVersion: / {gsub(/^[ \t]+/, "", $2); print $2}')
             echo "Publishing Chart: $ARTIFACT for last known released version: $APP_VERSION"
           fi
-          helm package deployment/tiktocker --destination . --version $CHART_VERSION --app-version "$APP_VERSION" 
-          helm push tiktocker-$VERSION.tgz $REF
+          helm package deployment/tiktocker --version $CHART_VERSION --app-version "$APP_VERSION" 
+          helm push tiktocker-$CHART_VERSION.tgz $REF
           echo "Publishing Chart completed" 
