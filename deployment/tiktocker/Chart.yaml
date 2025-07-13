@@ -4,6 +4,6 @@ name: tiktocker
 description: A Helm chart for Tiktocker - backup Mikrotik config to S3
 type: application
 
-version: 0.0.1
+version: 0.0.2
 
-appVersion: 0.0.1
+appVersion: 0.0.1 # automatically set by GitHub Actions
