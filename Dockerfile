@@ -12,6 +12,7 @@ FROM gcr.io/distroless/static
 
 WORKDIR /app
 COPY --from=builder /app/tiktocker ./
+COPY --from=builder /app/config.yaml ./
 
 VOLUME ["/etc/tiktocker"]
 
