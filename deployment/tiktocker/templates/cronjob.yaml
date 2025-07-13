@@ -25,7 +25,7 @@ spec:
               resources: {{- toYaml .Values.resources | nindent 16 }}
               volumeMounts:
                 - mountPath: /etc/tiktocker
-                  name: tiktocker
+                  name: tiktocker-config
           volumes:
             - name: tiktocker-config
               configMap:
