@@ -5,6 +5,8 @@ metadata:
   labels: {{ include "tiktocker.labels" . | nindent 4 }}
 spec:
   schedule: {{ .Values.tiktocker.schedule }}
+  concurrencyPolicy: Forbid
+  timeZone: {{.Values.tiktocker.timezone | default "UTC" }}
   jobTemplate:
     spec:
       template:

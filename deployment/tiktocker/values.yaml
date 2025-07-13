@@ -67,6 +67,7 @@ tolerations: []
 affinity: {}
 
 tiktocker:
+  timezone: "UTC"
   schedule: "0 3 * * *" # 3AM
   logLevel: "warn"
   directory: "" # whether to perform local download , takes precedence over s3
