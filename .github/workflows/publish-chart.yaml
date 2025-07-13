@@ -68,16 +68,7 @@ jobs:
           REF=oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           ARTIFACT="$REF:$CHART_VERSION"
           echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
-          if [ "$APP_VERSION" != "master" ]; then
-            echo "Publishing Chart: $ARTIFACT for new image: $APP_VERSION"
-          else
-            echo "Inspecting existing images"
-            helm pull $REF/tiktocker -d /tmp
-            APP_VERSION=$(helm show chart /tmp/tiktocker*.tgz | awk -F: '/appVersion: / {gsub(/^[ \t]+/, "", $2); print $2}')
-            # fixme race condition - on tag both: master and tag build, this logic runs concurrently
-            # may pick different appVersions 
-            echo "Publishing Chart: $ARTIFACT for last known released version: $APP_VERSION"
-          fi
+          # todo guard against not incremented chart version
           helm package deployment/tiktocker --version $CHART_VERSION --app-version "$APP_VERSION" 
           helm push tiktocker-$CHART_VERSION.tgz $REF
           echo "Publishing Chart completed" 

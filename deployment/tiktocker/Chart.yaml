@@ -4,6 +4,6 @@ name: tiktocker
 description: TikTocker - backup Mikrotik configs to S3
 type: application
 
-version: 0.0.6
+version: 0.0.7
 
-appVersion: 0.0.1 # don't change, automatically set by GitHub Actions
+appVersion: 0.0.4
