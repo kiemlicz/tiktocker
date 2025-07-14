@@ -30,7 +30,11 @@ jobs:
         with:
           filters: |
             tiktockerImage:
-              - '!(deployment/**|.github/**)'
+              - 'internal/**'
+              - 'cmd/**'
+              - 'Dockerfile'
+              - 'config.yaml'
+              - 'go.mod|go.sum'
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         if: steps.filter.outputs.tiktockerImage == 'true' || contains(github.ref, 'refs/tags/v')

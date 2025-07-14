@@ -65,3 +65,11 @@ mikrotiks:
 ### Running in Kubernetes
 
 TODO
+
+## Development
+
+### Releasing
+
+Docker image is built automatically on every commit to default branch, if git tag is present the image is tagged with the same tag.
+
+Chart is built given the `Chart.yaml` is modified
